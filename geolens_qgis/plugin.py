@@ -53,9 +53,10 @@ class GeoLensPlugin:
             self.iface.removeToolBarIcon(action)
         self.actions.clear()
         if self.toolbar:
-            del self.toolbar
+            self.toolbar.deleteLater()
             self.toolbar = None
         if self.dock:
+            self.dock.cleanup()
             self.iface.removeDockWidget(self.dock)
             self.dock.deleteLater()
             self.dock = None

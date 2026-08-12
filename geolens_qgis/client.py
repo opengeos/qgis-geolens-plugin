@@ -72,7 +72,7 @@ class GeoLensClient:
             try:
                 payload = json.loads(error.read().decode("utf-8"))
                 detail = payload.get("detail") or payload.get("title") or ""
-            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            except (ValueError, AttributeError, OSError):
                 detail = ""
             suffix = f": {detail}" if detail else ""
             raise GeoLensError(
@@ -149,7 +149,7 @@ class GeoLensClient:
                 (
                     link.get("href")
                     for link in page.get("links", [])
-                    if link.get("rel") == "next"
+                    if isinstance(link, dict) and link.get("rel") == "next"
                 ),
                 None,
             )

@@ -7,7 +7,10 @@ import argparse
 import os
 from pathlib import Path
 from urllib.parse import quote
-from xmlrpc.client import Binary, ServerProxy
+
+# nosec B411 - the only endpoint is the official plugins.qgis.org HTTPS RPC
+# service, which is also the only XML this script ever parses.
+from xmlrpc.client import Binary, ServerProxy  # nosec B411
 
 
 def upload(path: Path, username: str, password: str):
@@ -16,7 +19,7 @@ def upload(path: Path, username: str, password: str):
     )
     with path.open("rb") as stream:
         payload = Binary(stream.read())
-    server = ServerProxy(endpoint, verbose=False)  # nosec B307 - fixed HTTPS host.
+    server = ServerProxy(endpoint, verbose=False)
     return server.plugin.upload(payload)
 
 

@@ -20,3 +20,20 @@ def test_real_package_has_required_files(tmp_path):
     assert "geolens_qgis/metadata.txt" in names
     assert "geolens_qgis/LICENSE" in names
     assert not any("__pycache__" in name for name in names)
+
+
+def test_package_skips_symlinks_to_external_files(tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    source = tmp_path / "plugin"
+    source.mkdir()
+    for required in ("__init__.py", "metadata.txt", "LICENSE"):
+        (source / required).write_text("version=0.1.0\n", encoding="utf-8")
+    (source / "leak.txt").symlink_to(outside)
+
+    output = package_plugin(source, tmp_path / "plugin.zip")
+    with zipfile.ZipFile(output) as archive:
+        names = set(archive.namelist())
+    assert "plugin/leak.txt" not in names
+    assert "geolens_qgis/leak.txt" not in names
+    assert "geolens_qgis/metadata.txt" in names

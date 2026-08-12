@@ -18,5 +18,5 @@ repos:
     rev: 1.9.4
     hooks:
       - id: bandit
-        args: ["-r", "geolens_qgis"]
+        args: ["-r", "geolens_qgis", "install.py", "package_plugin.py", "scripts"]
         pass_filenames: false

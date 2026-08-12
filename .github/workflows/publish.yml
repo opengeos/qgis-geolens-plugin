@@ -18,8 +18,13 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      QGIS_PLUGIN_REPO_USERNAME: ${{ secrets.QGIS_PLUGIN_REPO_USERNAME }}
+      QGIS_PLUGIN_REPO_PASSWORD: ${{ secrets.QGIS_PLUGIN_REPO_PASSWORD }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
@@ -33,7 +38,5 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "$TAG" dist/geolens_qgis.zip --clobber
       - name: Upload to QGIS Plugins
-        env:
-          QGIS_PLUGIN_REPO_USERNAME: ${{ secrets.QGIS_PLUGIN_REPO_USERNAME }}
-          QGIS_PLUGIN_REPO_PASSWORD: ${{ secrets.QGIS_PLUGIN_REPO_PASSWORD }}
+        if: env.QGIS_PLUGIN_REPO_USERNAME != '' && env.QGIS_PLUGIN_REPO_PASSWORD != ''
         run: python scripts/upload_to_qgis_plugin_repo.py dist/geolens_qgis.zip

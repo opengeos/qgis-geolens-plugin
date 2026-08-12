@@ -36,6 +36,10 @@ def package_plugin(source: Path, output: Path, name: str = "geolens_qgis") -> Pa
                 pattern.fullmatch(path.name) for pattern in EXCLUDED_FILES
             ):
                 continue
+            # ZipFile.write follows symbolic links, which would copy file
+            # contents from outside the plugin tree into the archive.
+            if path.is_symlink():
+                continue
             archive.write(path, Path(name) / relative)
     return output
 

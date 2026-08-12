@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -10,6 +11,7 @@ import webbrowser
 from qgis.PyQt.QtCore import Qt, QSettings, QTimer
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDockWidget,
     QFormLayout,
@@ -40,6 +42,8 @@ from qgis.core import (
 from ..client import Dataset, GeoLensClient, GeoLensError
 
 ROLE_DATASET = Qt.ItemDataRole.UserRole
+# QgsJsonExporter writes six decimal places by default (RFC 7946).
+EXPORT_PRECISION = 6
 SAMPLE_SERVERS = (
     ("GeoLibre datasets", "https://datasets.geolibre.app"),
     ("GeoLens demo", "https://demo.getgeolens.com"),
@@ -82,10 +86,16 @@ class GeoLensDock(QDockWidget):
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("https://datasets.geolibre.app")
         self.key_edit = QLineEdit()
-        self.key_edit.setPlaceholderText("Optional; kept in this QGIS profile")
+        self.key_edit.setPlaceholderText("Optional; kept in memory for this session")
         self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.remember_key = QCheckBox("Remember API key in this QGIS profile")
+        self.remember_key.setToolTip(
+            "QGIS profile settings are stored as plain text. Leave this off "
+            "unless the profile directory is trusted."
+        )
         form.addRow("Server", self.url_edit)
         form.addRow("API key", self.key_edit)
+        form.addRow(self.remember_key)
         layout.addLayout(form)
 
         self.connect_button = QPushButton("Connect")
@@ -148,7 +158,9 @@ class GeoLensDock(QDockWidget):
     def _restore_settings(self):
         settings = QSettings()
         self.url_edit.setText(settings.value("geolens/server", "", str))
-        self.key_edit.setText(settings.value("geolens/api_key", "", str))
+        stored_key = settings.value("geolens/api_key", "", str)
+        self.key_edit.setText(stored_key)
+        self.remember_key.setChecked(bool(stored_key))
         self.limit.setValue(settings.value("geolens/feature_limit", 10000, int))
 
     def _choose_sample(self, index):
@@ -170,12 +182,13 @@ class GeoLensDock(QDockWidget):
         )
         self.metadata_button.setEnabled(connected and dataset is not None)
         layer = self.iface.activeLayer()
+        # Only layers with an in-session baseline can be diffed against the server.
         self.sync_button.setEnabled(
             bool(
                 connected
                 and self.editing_enabled
                 and layer
-                and layer.customProperty("geolens/dataset_id")
+                and layer.id() in self.baselines
             )
         )
 
@@ -195,7 +208,11 @@ class GeoLensDock(QDockWidget):
         self.editing_enabled = capabilities["dataset_editing"]
         settings = QSettings()
         settings.setValue("geolens/server", client.base_url)
-        settings.setValue("geolens/api_key", client.api_key)
+        # QSettings is plain text, so the key is only written on explicit opt-in.
+        if self.remember_key.isChecked():
+            settings.setValue("geolens/api_key", client.api_key)
+        else:
+            settings.remove("geolens/api_key")
         self._show_datasets(datasets)
         suffix = (
             " Editing is enabled."
@@ -244,7 +261,10 @@ class GeoLensDock(QDockWidget):
         except GeoLensError as error:
             self._message(str(error), Qgis.MessageLevel.Critical)
 
-    def _uri(self, source, include_key=False):
+    def _uri(self, source):
+        # Never put an API key in a layer URI: QGIS persists layer sources in
+        # project files. Private datasets should be connected through a
+        # user-managed QGIS Authentication configuration.
         uri = QgsDataSourceUri()
         uri.setParam("type", "xyz")
         uri.setParam("url", source["url"])
@@ -252,8 +272,6 @@ class GeoLensDock(QDockWidget):
             uri.setParam("zmin", str(source["minzoom"]))
         if source.get("maxzoom") is not None:
             uri.setParam("zmax", str(source["maxzoom"]))
-        if include_key and self.client and self.client.api_key:
-            uri.setParam("http-header:X-Api-Key", self.client.api_key)
         return bytes(uri.encodedUri()).decode()
 
     def _tag_layer(self, layer, dataset):
@@ -264,9 +282,6 @@ class GeoLensDock(QDockWidget):
         )
 
     def _add_raster(self, dataset, source):
-        # Never put an API key in a raster URI: QGIS persists layer sources in
-        # project files. Public rasters work directly; private rasters should be
-        # connected through a user-managed QGIS Authentication configuration.
         layer = QgsRasterLayer(self._uri(source), dataset.title, "wms")
         if not layer.isValid():
             raise GeoLensError("QGIS could not create the GeoLens raster tile layer")
@@ -330,12 +345,15 @@ class GeoLensDock(QDockWidget):
             bbox = self._current_bbox() if self.view_only.isChecked() else None
             collection = self.client.features(dataset.id, self.limit.value(), bbox)
             baseline = {}
+            unidentified = 0
             for feature in collection["features"]:
                 props = feature.setdefault("properties", {})
                 gid = feature.get("id", props.get("gid"))
-                if isinstance(gid, int):
+                if isinstance(gid, int) and not isinstance(gid, bool):
                     props["_geolens_gid"] = gid
                     baseline[gid] = _clean_feature(feature)
+                else:
+                    unidentified += 1
             handle, path = tempfile.mkstemp(prefix="geolens_", suffix=".geojson")
             os.close(handle)
             with open(path, "w", encoding="utf-8") as stream:
@@ -345,14 +363,27 @@ class GeoLensDock(QDockWidget):
             if not layer.isValid():
                 raise GeoLensError("QGIS could not create the GeoLens feature layer")
             self._tag_layer(layer, dataset)
-            layer.setCustomProperty("geolens/editable", True)
-            self.baselines[layer.id()] = baseline
+            # Synchronization matches features by integer server ID. A dataset
+            # that uses string or UUID identifiers would look entirely new and
+            # be duplicated onto the server, so it is loaded read-only instead.
+            syncable = unidentified == 0
+            layer.setCustomProperty("geolens/editable", syncable)
+            if syncable:
+                self.baselines[layer.id()] = baseline
             QgsProject.instance().addMapLayer(layer)
             self._zoom_to(dataset)
             QSettings().setValue("geolens/feature_limit", self.limit.value())
-            self._message(
-                f"Added {layer.featureCount():,} editable features: {dataset.title}"
-            )
+            if syncable:
+                self._message(
+                    f"Added {layer.featureCount():,} editable features: {dataset.title}"
+                )
+            else:
+                self._message(
+                    f"Added {layer.featureCount():,} features: {dataset.title}. "
+                    f"{unidentified:,} feature(s) have no integer server ID, so "
+                    "synchronization is disabled for this layer.",
+                    Qgis.MessageLevel.Warning,
+                )
         except (GeoLensError, OSError) as error:
             self._message(str(error), Qgis.MessageLevel.Critical)
 
@@ -384,7 +415,9 @@ class GeoLensDock(QDockWidget):
         baseline = self.baselines.get(layer.id())
         if not dataset_id or baseline is None:
             self._message(
-                "The selected layer has no GeoLens edit baseline in this session.",
+                "The selected layer has no GeoLens edit baseline in this session. "
+                "Reload it with Add features; datasets without integer feature "
+                "IDs cannot be synchronized.",
                 Qgis.MessageLevel.Warning,
             )
             return
@@ -406,11 +439,23 @@ class GeoLensDock(QDockWidget):
                 current[gid] = cleaned
             else:
                 creates.append((qfeature.id(), cleaned))
-        updates = [
-            (gid, feature)
-            for gid, feature in current.items()
-            if baseline.get(gid) != feature
-        ]
+        updates = []
+        for gid, feature in current.items():
+            previous = baseline.get(gid)
+            if previous is None:
+                updates.append((gid, feature))
+                continue
+            # QgsJsonExporter rounds coordinates, so an untouched server
+            # geometry can differ from its export. Compare at export precision
+            # and keep the server geometry when only attributes changed.
+            same_geometry = _rounded(previous.get("geometry")) == _rounded(
+                feature.get("geometry")
+            )
+            if same_geometry:
+                if previous.get("properties") == feature.get("properties"):
+                    continue
+                feature = {**feature, "geometry": previous.get("geometry")}
+            updates.append((gid, feature))
         deletes = sorted(set(baseline) - set(current))
         total = len(creates) + len(updates) + len(deletes)
         if not total:
@@ -433,21 +478,26 @@ class GeoLensDock(QDockWidget):
                 baseline[gid] = feature
             except GeoLensError as error:
                 errors.append(str(error))
+        created = []
         for fid, feature in creates:
             try:
                 gid = self.client.create_feature(dataset_id, feature)
                 if gid is not None:
                     baseline[gid] = feature
-                    gid_index = layer.fields().indexOf("_geolens_gid")
-                    if gid_index >= 0:
-                        layer.startEditing()
-                        layer.changeAttributeValue(fid, gid_index, gid)
-                        if not layer.commitChanges():
-                            errors.append(
-                                f"Feature {gid} was created, but its server ID could not be stored locally"
-                            )
+                    created.append((fid, gid))
             except GeoLensError as error:
                 errors.append(str(error))
+        # One edit session for every new ID: each commit rewrites the layer file.
+        gid_index = layer.fields().indexOf("_geolens_gid")
+        if created and gid_index >= 0:
+            layer.startEditing()
+            for fid, gid in created:
+                layer.changeAttributeValue(fid, gid_index, gid)
+            if not layer.commitChanges():
+                errors.append(
+                    f"{len(created)} feature(s) were created, but their server "
+                    "IDs could not be stored locally"
+                )
         for gid in deletes:
             try:
                 self.client.delete_feature(dataset_id, gid)
@@ -461,6 +511,20 @@ class GeoLensDock(QDockWidget):
             )
         else:
             self._message(f"Synchronized {total} change(s) to GeoLens.")
+
+    def cleanup(self):
+        """Stop tile refresh timers and delete downloaded feature files.
+
+        Called by the plugin on unload; hiding the dock deliberately keeps
+        everything alive so a reopened dock resumes where it left off.
+        """
+        for timer in self.refresh_timers.values():
+            timer.stop()
+        self.refresh_timers.clear()
+        for path in self.temp_files:
+            with contextlib.suppress(OSError):
+                os.unlink(path)
+        self.temp_files.clear()
 
     def closeEvent(self, event):
         # Hiding retains in-memory API keys, baselines, and tile refresh timers.
@@ -476,3 +540,14 @@ def _clean_feature(feature):
         "geometry": feature.get("geometry"),
         "properties": properties,
     }
+
+
+def _rounded(node, ndigits=EXPORT_PRECISION):
+    """Round every coordinate in a GeoJSON geometry to `ndigits` decimals."""
+    if isinstance(node, float):
+        return round(node, ndigits)
+    if isinstance(node, list):
+        return [_rounded(value, ndigits) for value in node]
+    if isinstance(node, dict):
+        return {key: _rounded(value, ndigits) for key, value in node.items()}
+    return node
