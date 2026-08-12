@@ -1,0 +1,420 @@
+"""QGIS user interface and layer integration for GeoLens."""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import webbrowser
+
+from qgis.PyQt.QtCore import Qt, QSettings, QTimer, QUrl
+from qgis.PyQt.QtGui import QAction
+from qgis.PyQt.QtWidgets import (
+    QAbstractItemView, QComboBox, QDockWidget, QFormLayout, QHBoxLayout,
+    QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox, QTreeWidget,
+    QTreeWidgetItem, QVBoxLayout, QWidget,
+)
+from qgis.core import (
+    Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsDataSourceUri,
+    QgsJsonExporter, QgsProject, QgsRasterLayer, QgsRectangle, QgsVectorLayer,
+    QgsVectorTileLayer,
+)
+
+from .client import Dataset, GeoLensClient, GeoLensError
+
+
+ROLE_DATASET = Qt.UserRole
+SAMPLE_SERVERS = (
+    ("GeoLibre datasets", "https://datasets.geolibre.app"),
+    ("GeoLens demo", "https://demo.getgeolens.com"),
+)
+
+
+class GeoLensPlugin:
+    def __init__(self, iface):
+        self.iface = iface
+        self.action = None
+        self.dock = None
+
+    def initGui(self):
+        self.action = QAction("GeoLens", self.iface.mainWindow())
+        self.action.setObjectName("GeoLensAction")
+        self.action.triggered.connect(self.show_panel)
+        self.iface.addPluginToWebMenu("GeoLens", self.action)
+        self.iface.addToolBarIcon(self.action)
+
+    def unload(self):
+        if self.action:
+            self.iface.removePluginWebMenu("GeoLens", self.action)
+            self.iface.removeToolBarIcon(self.action)
+        if self.dock:
+            self.iface.removeDockWidget(self.dock)
+            self.dock.deleteLater()
+
+    def show_panel(self):
+        if self.dock is None:
+            self.dock = GeoLensDock(self.iface)
+            self.iface.addDockWidget(Qt.RightDockWidgetArea, self.dock)
+        self.dock.show()
+        self.dock.raise_()
+
+
+class GeoLensDock(QDockWidget):
+    def __init__(self, iface):
+        super().__init__("GeoLens", iface.mainWindow())
+        self.setObjectName("GeoLensDock")
+        self.iface = iface
+        self.client: GeoLensClient | None = None
+        self.datasets: dict[str, Dataset] = {}
+        self.baselines: dict[str, dict[int, dict]] = {}
+        self.temp_files: list[str] = []
+        self.refresh_timers: dict[str, QTimer] = {}
+        self.editing_enabled = False
+        self._build_ui()
+        self._restore_settings()
+
+    def _build_ui(self):
+        root = QWidget(self)
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(8, 8, 8, 8)
+        intro = QLabel("Browse and add datasets from a self-hosted GeoLens server.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.samples = QComboBox()
+        self.samples.addItem("Sample server…", "")
+        for label, url in SAMPLE_SERVERS:
+            self.samples.addItem(label, url)
+        self.samples.currentIndexChanged.connect(self._choose_sample)
+        layout.addWidget(self.samples)
+
+        form = QFormLayout()
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("https://datasets.geolibre.app")
+        self.key_edit = QLineEdit()
+        self.key_edit.setPlaceholderText("Optional; kept in this QGIS profile")
+        self.key_edit.setEchoMode(QLineEdit.Password)
+        form.addRow("Server", self.url_edit)
+        form.addRow("API key", self.key_edit)
+        layout.addLayout(form)
+
+        self.connect_button = QPushButton("Connect")
+        self.connect_button.clicked.connect(self.connect_server)
+        layout.addWidget(self.connect_button)
+
+        search_row = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search the catalog")
+        self.search_edit.returnPressed.connect(self.search)
+        search_button = QPushButton("Search")
+        search_button.clicked.connect(self.search)
+        search_row.addWidget(self.search_edit)
+        search_row.addWidget(search_button)
+        layout.addLayout(search_row)
+
+        self.results = QTreeWidget()
+        self.results.setHeaderLabels(["Dataset", "Type", "Features"])
+        self.results.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.results.itemSelectionChanged.connect(self._update_actions)
+        layout.addWidget(self.results, 1)
+
+        options = QFormLayout()
+        self.limit = QSpinBox()
+        self.limit.setRange(1, 1_000_000)
+        self.limit.setValue(10_000)
+        self.view_only = QPushButton("Current map extent: On")
+        self.view_only.setCheckable(True)
+        self.view_only.setChecked(True)
+        self.view_only.toggled.connect(lambda value: self.view_only.setText(f"Current map extent: {'On' if value else 'Off'}"))
+        options.addRow("Feature limit", self.limit)
+        options.addRow(self.view_only)
+        layout.addLayout(options)
+
+        first_actions = QHBoxLayout()
+        self.tiles_button = QPushButton("Add tiles")
+        self.features_button = QPushButton("Add features")
+        self.metadata_button = QPushButton("Metadata")
+        self.tiles_button.clicked.connect(self.add_tiles)
+        self.features_button.clicked.connect(self.add_features)
+        self.metadata_button.clicked.connect(self.open_metadata)
+        first_actions.addWidget(self.tiles_button)
+        first_actions.addWidget(self.features_button)
+        first_actions.addWidget(self.metadata_button)
+        layout.addLayout(first_actions)
+
+        self.sync_button = QPushButton("Sync selected GeoLens layer edits")
+        self.sync_button.clicked.connect(self.sync_active_layer)
+        layout.addWidget(self.sync_button)
+        self.status = QLabel("Not connected")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+        self.setWidget(root)
+        self._update_actions()
+
+    def _restore_settings(self):
+        settings = QSettings()
+        self.url_edit.setText(settings.value("geolens/server", "", str))
+        self.key_edit.setText(settings.value("geolens/api_key", "", str))
+        self.limit.setValue(settings.value("geolens/feature_limit", 10000, int))
+
+    def _choose_sample(self, index):
+        url = self.samples.itemData(index)
+        if url:
+            self.url_edit.setText(url)
+            self.key_edit.clear()
+
+    def _selected_dataset(self) -> Dataset | None:
+        items = self.results.selectedItems()
+        return items[0].data(0, ROLE_DATASET) if items else None
+
+    def _update_actions(self):
+        dataset = self._selected_dataset()
+        connected = self.client is not None
+        self.tiles_button.setEnabled(connected and dataset is not None)
+        self.features_button.setEnabled(connected and dataset is not None and not dataset.is_raster)
+        self.metadata_button.setEnabled(connected and dataset is not None)
+        layer = self.iface.activeLayer()
+        self.sync_button.setEnabled(bool(connected and self.editing_enabled and layer and layer.customProperty("geolens/dataset_id")))
+
+    def _message(self, text, level=Qgis.Info):
+        self.status.setText(text)
+        self.iface.messageBar().pushMessage("GeoLens", text, level=level, duration=6)
+
+    def connect_server(self):
+        try:
+            client = GeoLensClient(self.url_edit.text(), self.key_edit.text())
+            datasets = client.search(limit=50)
+            capabilities = client.capabilities()
+        except (ValueError, GeoLensError) as error:
+            self._message(str(error), Qgis.Critical)
+            return
+        self.client = client
+        self.editing_enabled = capabilities["dataset_editing"]
+        settings = QSettings()
+        settings.setValue("geolens/server", client.base_url)
+        settings.setValue("geolens/api_key", client.api_key)
+        self._show_datasets(datasets)
+        suffix = " Editing is enabled." if self.editing_enabled else " Editing is disabled by this server."
+        self._message(f"Connected — {len(datasets)} datasets.{suffix}")
+
+    def search(self):
+        if not self.client:
+            self.connect_server()
+            return
+        try:
+            datasets = self.client.search(self.search_edit.text(), 50)
+            self._show_datasets(datasets)
+            self.status.setText(f"{len(datasets)} dataset(s)")
+        except GeoLensError as error:
+            self._message(str(error), Qgis.Critical)
+
+    def _show_datasets(self, datasets):
+        self.results.clear()
+        self.datasets = {dataset.id: dataset for dataset in datasets}
+        for dataset in datasets:
+            count = "" if dataset.feature_count is None else f"{dataset.feature_count:,}"
+            item = QTreeWidgetItem([dataset.title, "raster" if dataset.is_raster else "vector", count])
+            item.setData(0, ROLE_DATASET, dataset)
+            item.setToolTip(0, dataset.description)
+            self.results.addTopLevelItem(item)
+        self.results.resizeColumnToContents(0)
+        self._update_actions()
+
+    def add_tiles(self):
+        dataset = self._selected_dataset()
+        if not self.client or not dataset:
+            return
+        try:
+            source = self.client.tile_source(dataset.id)
+            if source.get("kind") == "raster":
+                self._add_raster(dataset, source)
+            else:
+                self._add_vector_tiles(dataset, source)
+        except GeoLensError as error:
+            self._message(str(error), Qgis.Critical)
+
+    def _uri(self, source, include_key=False):
+        uri = QgsDataSourceUri()
+        uri.setParam("type", "xyz")
+        uri.setParam("url", source["url"])
+        if source.get("minzoom") is not None:
+            uri.setParam("zmin", str(source["minzoom"]))
+        if source.get("maxzoom") is not None:
+            uri.setParam("zmax", str(source["maxzoom"]))
+        if include_key and self.client and self.client.api_key:
+            uri.setParam("http-header:X-Api-Key", self.client.api_key)
+        return bytes(uri.encodedUri()).decode()
+
+    def _tag_layer(self, layer, dataset):
+        layer.setCustomProperty("geolens/server", self.client.base_url)
+        layer.setCustomProperty("geolens/dataset_id", dataset.id)
+        layer.setCustomProperty("geolens/metadata_url", self.client.metadata_url(dataset.id))
+
+    def _add_raster(self, dataset, source):
+        # Never put an API key in a raster URI: QGIS persists layer sources in
+        # project files. Public rasters work directly; private rasters should be
+        # connected through a user-managed QGIS Authentication configuration.
+        layer = QgsRasterLayer(self._uri(source), dataset.title, "wms")
+        if not layer.isValid():
+            raise GeoLensError("QGIS could not create the GeoLens raster tile layer")
+        self._tag_layer(layer, dataset)
+        QgsProject.instance().addMapLayer(layer)
+        self._zoom_to(dataset)
+        self._message(f"Added raster tiles: {dataset.title}")
+
+    def _add_vector_tiles(self, dataset, source):
+        layer = QgsVectorTileLayer(self._uri(source), dataset.title)
+        if not layer.isValid():
+            raise GeoLensError("QGIS could not create the GeoLens vector tile layer")
+        self._tag_layer(layer, dataset)
+        layer.setCustomProperty("geolens/source_layer", source.get("source_layer", ""))
+        QgsProject.instance().addMapLayer(layer)
+        self._schedule_refresh(layer, dataset, source)
+        self._zoom_to(dataset)
+        self._message(f"Added vector tiles: {dataset.title}")
+
+    def _schedule_refresh(self, layer, dataset, source):
+        seconds = max(10, int(source.get("expires_in") or 60) - 30)
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        def refresh():
+            if not QgsProject.instance().mapLayer(layer.id()) or not self.client:
+                return
+            try:
+                renewed = self.client.tile_source(dataset.id)
+                layer.setDataSource(self._uri(renewed), layer.name(), "vectortile")
+                self._schedule_refresh(layer, dataset, renewed)
+            except GeoLensError:
+                timer.start(60_000)
+        timer.timeout.connect(refresh)
+        timer.start(seconds * 1000)
+        old = self.refresh_timers.pop(layer.id(), None)
+        if old:
+            old.stop()
+        self.refresh_timers[layer.id()] = timer
+
+    def _current_bbox(self):
+        extent = self.iface.mapCanvas().extent()
+        crs = self.iface.mapCanvas().mapSettings().destinationCrs()
+        if crs != QgsCoordinateReferenceSystem("EPSG:4326"):
+            extent = QgsCoordinateTransform(crs, QgsCoordinateReferenceSystem("EPSG:4326"), QgsProject.instance()).transformBoundingBox(extent)
+        return extent.xMinimum(), extent.yMinimum(), extent.xMaximum(), extent.yMaximum()
+
+    def add_features(self):
+        dataset = self._selected_dataset()
+        if not self.client or not dataset:
+            return
+        try:
+            bbox = self._current_bbox() if self.view_only.isChecked() else None
+            collection = self.client.features(dataset.id, self.limit.value(), bbox)
+            baseline = {}
+            for feature in collection["features"]:
+                props = feature.setdefault("properties", {})
+                gid = feature.get("id", props.get("gid"))
+                if isinstance(gid, int):
+                    props["_geolens_gid"] = gid
+                    baseline[gid] = _clean_feature(feature)
+            handle, path = tempfile.mkstemp(prefix="geolens_", suffix=".geojson")
+            os.close(handle)
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(collection, stream)
+            self.temp_files.append(path)
+            layer = QgsVectorLayer(path, dataset.title, "ogr")
+            if not layer.isValid():
+                raise GeoLensError("QGIS could not create the GeoLens feature layer")
+            self._tag_layer(layer, dataset)
+            layer.setCustomProperty("geolens/editable", True)
+            self.baselines[layer.id()] = baseline
+            QgsProject.instance().addMapLayer(layer)
+            self._zoom_to(dataset)
+            QSettings().setValue("geolens/feature_limit", self.limit.value())
+            self._message(f"Added {layer.featureCount():,} editable features: {dataset.title}")
+        except (GeoLensError, OSError) as error:
+            self._message(str(error), Qgis.Critical)
+
+    def _zoom_to(self, dataset):
+        if dataset.bbox:
+            rect = QgsRectangle(*dataset.bbox)
+            transform = QgsCoordinateTransform(QgsCoordinateReferenceSystem("EPSG:4326"), self.iface.mapCanvas().mapSettings().destinationCrs(), QgsProject.instance())
+            self.iface.mapCanvas().setExtent(transform.transformBoundingBox(rect))
+            self.iface.mapCanvas().refresh()
+
+    def open_metadata(self):
+        dataset = self._selected_dataset()
+        if self.client and dataset:
+            webbrowser.open(self.client.metadata_url(dataset.id))
+
+    def sync_active_layer(self):
+        layer = self.iface.activeLayer()
+        if not self.client or not isinstance(layer, QgsVectorLayer):
+            self._message("Select an editable feature layer loaded from GeoLens.", Qgis.Warning)
+            return
+        dataset_id = layer.customProperty("geolens/dataset_id", "")
+        baseline = self.baselines.get(layer.id())
+        if not dataset_id or baseline is None:
+            self._message("The selected layer has no GeoLens edit baseline in this session.", Qgis.Warning)
+            return
+        if layer.isEditable() and not layer.commitChanges():
+            self._message("Commit the QGIS layer edits before synchronizing.", Qgis.Warning)
+            return
+        current = {}
+        creates = []
+        exporter = QgsJsonExporter(layer)
+        exporter.setIncludeGeometry(True)
+        for qfeature in layer.getFeatures():
+            feature = json.loads(exporter.exportFeature(qfeature))
+            gid = feature.get("properties", {}).get("_geolens_gid")
+            cleaned = _clean_feature(feature)
+            if isinstance(gid, int):
+                current[gid] = cleaned
+            else:
+                creates.append((qfeature.id(), cleaned))
+        updates = [(gid, feature) for gid, feature in current.items() if baseline.get(gid) != feature]
+        deletes = sorted(set(baseline) - set(current))
+        total = len(creates) + len(updates) + len(deletes)
+        if not total:
+            self._message("No local changes to synchronize.")
+            return
+        if deletes and QMessageBox.question(self, "Delete GeoLens features", f"Synchronizing will delete {len(deletes)} server feature(s). Continue?") != QMessageBox.Yes:
+            return
+        errors = []
+        for gid, feature in updates:
+            try:
+                self.client.update_feature(dataset_id, gid, feature)
+                baseline[gid] = feature
+            except GeoLensError as error:
+                errors.append(str(error))
+        for fid, feature in creates:
+            try:
+                gid = self.client.create_feature(dataset_id, feature)
+                if gid is not None:
+                    baseline[gid] = feature
+                    gid_index = layer.fields().indexOf("_geolens_gid")
+                    if gid_index >= 0:
+                        layer.startEditing()
+                        layer.changeAttributeValue(fid, gid_index, gid)
+                        if not layer.commitChanges():
+                            errors.append(f"Feature {gid} was created, but its server ID could not be stored locally")
+            except GeoLensError as error:
+                errors.append(str(error))
+        for gid in deletes:
+            try:
+                self.client.delete_feature(dataset_id, gid)
+                baseline.pop(gid, None)
+            except GeoLensError as error:
+                errors.append(str(error))
+        if errors:
+            self._message(f"Synchronized {total - len(errors)}/{total}; {len(errors)} failed. {errors[0]}", Qgis.Warning)
+        else:
+            self._message(f"Synchronized {total} change(s) to GeoLens.")
+
+    def closeEvent(self, event):
+        # Hiding retains in-memory API keys, baselines, and tile refresh timers.
+        event.ignore()
+        self.hide()
+
+
+def _clean_feature(feature):
+    properties = dict(feature.get("properties") or {})
+    properties.pop("_geolens_gid", None)
+    return {"type": "Feature", "geometry": feature.get("geometry"), "properties": properties}

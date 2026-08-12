@@ -1,0 +1,77 @@
+import json
+import unittest
+from io import BytesIO
+from urllib.parse import parse_qs, urlparse
+
+from geolens_qgis.client import GeoLensClient, parse_dataset
+
+
+class Response:
+    def __init__(self, body):
+        self.body = json.dumps(body).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def read(self):
+        return self.body
+
+
+class Recorder:
+    def __init__(self, responses):
+        self.responses = iter(responses)
+        self.requests = []
+
+    def __call__(self, request, timeout=0):
+        self.requests.append(request)
+        return Response(next(self.responses))
+
+
+class ClientTests(unittest.TestCase):
+    def test_normalizes_url_and_sends_api_key(self):
+        recorder = Recorder([{"features": []}])
+        client = GeoLensClient(" example.com/ ", "secret", recorder)
+        self.assertEqual(client.search(), [])
+        request = recorder.requests[0]
+        self.assertEqual(request.get_header("X-api-key"), "secret")
+        self.assertEqual(urlparse(request.full_url).netloc, "example.com")
+
+    def test_parses_vector_and_raster_datasets(self):
+        vector = parse_dataset({"id": "roads", "properties": {"title": "Roads", "geometry_type": "LINESTRING", "feature_count": 2}})
+        raster = parse_dataset({"id": "dem", "properties": {"record_type": "raster_dataset", "band_count": 1}})
+        self.assertEqual(vector.title, "Roads")
+        self.assertFalse(vector.is_raster)
+        self.assertTrue(raster.is_raster)
+
+    def test_builds_signed_vector_tile_source(self):
+        recorder = Recorder([{"kind": "vector", "sig": "abc", "exp": 42, "scope": "roads", "expires_in": 60}])
+        source = GeoLensClient("https://example.com", opener=recorder).tile_source("id with space")
+        self.assertEqual(source["source_layer"], "data.roads")
+        self.assertIn("/api/tiles/data.roads/{z}/{x}/{y}.pbf?", source["url"])
+        self.assertEqual(parse_qs(urlparse(source["url"]).query)["sig"], ["abc"])
+        self.assertIn("id%20with%20space", recorder.requests[0].full_url)
+
+    def test_follows_next_links_but_rebases_origin(self):
+        recorder = Recorder([
+            {"type": "FeatureCollection", "features": [{"id": 1}], "links": [{"rel": "next", "href": "http://localhost:8080/api/items?page=2"}]},
+            {"type": "FeatureCollection", "features": [{"id": 2}], "links": []},
+        ])
+        collection = GeoLensClient("https://example.com", opener=recorder).features("roads", 2)
+        self.assertEqual([item["id"] for item in collection["features"]], [1, 2])
+        self.assertEqual(urlparse(recorder.requests[1].full_url).netloc, "example.com")
+
+    def test_feature_writes_use_expected_methods(self):
+        recorder = Recorder([{"id": 9}, {}, {}])
+        client = GeoLensClient("https://example.com", opener=recorder)
+        feature = {"geometry": {"type": "Point", "coordinates": [0, 0]}, "properties": {"name": "A"}}
+        self.assertEqual(client.create_feature("places", feature), 9)
+        client.update_feature("places", 9, feature)
+        client.delete_feature("places", 9)
+        self.assertEqual([request.method for request in recorder.requests], ["POST", "PUT", "DELETE"])
+
+
+if __name__ == "__main__":
+    unittest.main()
