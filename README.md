@@ -1,6 +1,6 @@
 # GeoLens for QGIS
 
-A QGIS plugin for browsing and using datasets from a self-hosted [GeoLens](https://getgeolens.com) server. It brings the GeoLens catalog workflow from [GeoLibre](https://github.com/opengeos/GeoLibre) into QGIS.
+A QGIS 3.28+/4.x plugin for browsing and using datasets from a self-hosted [GeoLens](https://getgeolens.com) server. It brings the GeoLens catalog workflow from [GeoLibre](https://github.com/opengeos/GeoLibre) into QGIS and follows the structure of [opengeos/qgis-plugin-template](https://github.com/opengeos/qgis-plugin-template).
 
 ## Features
 
@@ -20,7 +20,7 @@ Clone the repository and link its plugin directory into your active QGIS profile
 ```bash
 git clone https://github.com/opengeos/qgis-geolens-plugin.git
 cd qgis-geolens-plugin
-make install
+python install.py
 ```
 
 Restart QGIS, enable **GeoLens** in **Plugins → Manage and Install Plugins**, then open it from **Web → GeoLens** or the toolbar.
@@ -28,7 +28,7 @@ Restart QGIS, enable **GeoLens** in **Plugins → Manage and Install Plugins**, 
 The default Linux profile is `~/.local/share/QGIS/QGIS3/profiles/default/python/plugins`. Override it when needed:
 
 ```bash
-make install QGIS_PLUGIN_DIR=/path/to/profile/python/plugins
+python install.py --plugin-dir /path/to/profile/python/plugins
 ```
 
 ## Usage
@@ -51,12 +51,33 @@ project files.
 The HTTP client has no QGIS dependency, so its tests run with standard Python:
 
 ```bash
-python -m unittest discover -s tests -v
+python -m pytest tests -v
 python -m compileall -q geolens_qgis
-make package
+python package_plugin.py
 ```
 
-The generated `dist/geolens_qgis.zip` has the directory layout expected by the QGIS Plugin Manager.
+The generated `dist/geolens_qgis-<version>.zip` has the directory layout expected by the QGIS Plugin Manager.
+
+## Project structure
+
+```text
+geolens_qgis/
+├── dialogs/geolens_dock.py  # Catalog, layer, and edit-sync panel
+├── icons/                   # Toolbar and About SVG assets
+├── client.py                # Dependency-free GeoLens API client
+├── plugin.py                # QGIS lifecycle, menu, and toolbar integration
+├── metadata.txt
+└── LICENSE
+tests/                       # API, package, and PyQt6 import tests
+install.py                   # Cross-platform development installer
+package_plugin.py            # QGIS repository archive builder
+.github/workflows/           # CI and release publishing
+```
+
+CI mirrors the template with pre-commit, Bandit, and PyQt6 smoke-test jobs.
+Publishing a GitHub release builds and attaches the plugin archive; when QGIS
+repository credentials are configured, the same workflow uploads it to
+plugins.qgis.org.
 
 ## License
 

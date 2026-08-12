@@ -4,16 +4,14 @@ QGIS_PLUGIN_DIR ?= $(HOME)/.local/share/QGIS/QGIS3/profiles/default/python/plugi
 .PHONY: test install package clean
 
 test:
-	python -m unittest discover -s tests -v
+	python -m pytest tests -v
 	python -m compileall -q $(PLUGIN_NAME)
 
 install:
-	mkdir -p "$(QGIS_PLUGIN_DIR)"
-	ln -sfn "$(CURDIR)/$(PLUGIN_NAME)" "$(QGIS_PLUGIN_DIR)/$(PLUGIN_NAME)"
+	python install.py --plugin-dir "$(QGIS_PLUGIN_DIR)"
 
 package: clean
-	mkdir -p dist
-	python -c 'import shutil; shutil.make_archive("dist/$(PLUGIN_NAME)", "zip", root_dir=".", base_dir="$(PLUGIN_NAME)")'
+	python package_plugin.py --output "dist/$(PLUGIN_NAME).zip"
 
 clean:
 	rm -rf dist

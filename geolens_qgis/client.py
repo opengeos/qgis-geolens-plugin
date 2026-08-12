@@ -31,7 +31,12 @@ class Dataset:
 
 
 class GeoLensClient:
-    def __init__(self, base_url: str, api_key: str = "", opener: Callable = urlopen):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "",
+        opener: Callable = urlopen,
+    ):
         raw = base_url.strip()
         if raw and not raw.lower().startswith(("http://", "https://")):
             raw = "https://" + raw
@@ -47,7 +52,11 @@ class GeoLensClient:
         return {"X-Api-Key": self.api_key} if self.api_key else {}
 
     def _request(self, path_or_url: str, method: str = "GET", body: Any = None) -> Any:
-        url = path_or_url if path_or_url.startswith(("http://", "https://")) else self.base_url + path_or_url
+        url = (
+            path_or_url
+            if path_or_url.startswith(("http://", "https://"))
+            else self.base_url + path_or_url
+        )
         headers = dict(self.headers)
         data = None
         if body is not None:
@@ -63,10 +72,12 @@ class GeoLensClient:
             try:
                 payload = json.loads(error.read().decode("utf-8"))
                 detail = payload.get("detail") or payload.get("title") or ""
-            except Exception:
-                pass
+            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                detail = ""
             suffix = f": {detail}" if detail else ""
-            raise GeoLensError(f"GeoLens request failed (HTTP {error.code}){suffix}") from error
+            raise GeoLensError(
+                f"GeoLens request failed (HTTP {error.code}){suffix}"
+            ) from error
         except OSError as error:
             raise GeoLensError(f"Could not reach GeoLens: {error}") from error
 
@@ -100,10 +111,18 @@ class GeoLensClient:
         if not all(body.get(key) is not None for key in required):
             raise GeoLensError("GeoLens vector tile response was malformed")
         table = "data." + str(body["scope"])
-        query = urlencode({"sig": body["sig"], "exp": body["exp"], "scope": body["scope"]})
-        return {**body, "url": f"{self.base_url}/api/tiles/{table}/{{z}}/{{x}}/{{y}}.pbf?{query}", "source_layer": table}
+        query = urlencode(
+            {"sig": body["sig"], "exp": body["exp"], "scope": body["scope"]}
+        )
+        return {
+            **body,
+            "url": f"{self.base_url}/api/tiles/{table}/{{z}}/{{x}}/{{y}}.pbf?{query}",
+            "source_layer": table,
+        }
 
-    def features(self, dataset_id: str, limit: int = 10_000, bbox: Iterable[float] | None = None) -> dict[str, Any]:
+    def features(
+        self, dataset_id: str, limit: int = 10_000, bbox: Iterable[float] | None = None
+    ) -> dict[str, Any]:
         requested = max(1, int(limit))
         params: dict[str, Any] = {"limit": min(requested, 10_000)}
         if bbox is not None:
@@ -111,7 +130,9 @@ class GeoLensClient:
             if len(values) != 4:
                 raise ValueError("bbox must contain four coordinates")
             params["bbox"] = ",".join(str(value) for value in values)
-        path = f"/api/collections/{quote(dataset_id, safe='')}/items?{urlencode(params)}"
+        path = (
+            f"/api/collections/{quote(dataset_id, safe='')}/items?{urlencode(params)}"
+        )
         output: list[dict[str, Any]] = []
         first: dict[str, Any] = {}
         seen: set[str] = set()
@@ -124,25 +145,42 @@ class GeoLensClient:
             if not first:
                 first = page
             output.extend(page["features"][: requested - len(output)])
-            next_link = next((link.get("href") for link in page.get("links", []) if link.get("rel") == "next"), None)
+            next_link = next(
+                (
+                    link.get("href")
+                    for link in page.get("links", [])
+                    if link.get("rel") == "next"
+                ),
+                None,
+            )
             if next_link:
                 resolved = urlparse(urljoin(url, next_link))
                 base = urlparse(self.base_url)
-                url = urlunparse((base.scheme, base.netloc, resolved.path, "", resolved.query, ""))
+                url = urlunparse(
+                    (base.scheme, base.netloc, resolved.path, "", resolved.query, "")
+                )
             else:
                 url = ""
         return {**first, "type": "FeatureCollection", "features": output}
 
     def create_feature(self, dataset_id: str, feature: dict[str, Any]) -> int | None:
-        body = self._request(f"/api/datasets/{quote(dataset_id, safe='')}/features/", "POST", feature)
+        body = self._request(
+            f"/api/datasets/{quote(dataset_id, safe='')}/features/", "POST", feature
+        )
         value = (body or {}).get("id", (body or {}).get("gid"))
         return value if isinstance(value, int) else None
 
-    def update_feature(self, dataset_id: str, gid: int, feature: dict[str, Any]) -> None:
-        self._request(f"/api/datasets/{quote(dataset_id, safe='')}/features/{gid}", "PUT", feature)
+    def update_feature(
+        self, dataset_id: str, gid: int, feature: dict[str, Any]
+    ) -> None:
+        self._request(
+            f"/api/datasets/{quote(dataset_id, safe='')}/features/{gid}", "PUT", feature
+        )
 
     def delete_feature(self, dataset_id: str, gid: int) -> None:
-        self._request(f"/api/datasets/{quote(dataset_id, safe='')}/features/{gid}", "DELETE")
+        self._request(
+            f"/api/datasets/{quote(dataset_id, safe='')}/features/{gid}", "DELETE"
+        )
 
     def metadata_url(self, dataset_id: str) -> str:
         return f"{self.base_url}/datasets/{quote(dataset_id, safe='')}"
@@ -151,23 +189,35 @@ class GeoLensClient:
 def parse_dataset(feature: Any) -> Dataset | None:
     if not isinstance(feature, dict) or not isinstance(feature.get("id"), str):
         return None
-    props = feature.get("properties") if isinstance(feature.get("properties"), dict) else {}
+    props = (
+        feature.get("properties") if isinstance(feature.get("properties"), dict) else {}
+    )
     return Dataset(
-        id=feature["id"], title=props.get("title") or feature["id"],
-        description=props.get("description") or "", record_type=props.get("record_type"),
-        geometry_type=props.get("geometry_type"), feature_count=props.get("feature_count"),
-        band_count=props.get("band_count"), bbox=_geometry_bbox(feature.get("geometry")),
+        id=feature["id"],
+        title=props.get("title") or feature["id"],
+        description=props.get("description") or "",
+        record_type=props.get("record_type"),
+        geometry_type=props.get("geometry_type"),
+        feature_count=props.get("feature_count"),
+        band_count=props.get("band_count"),
+        bbox=_geometry_bbox(feature.get("geometry")),
     )
 
 
 def _geometry_bbox(geometry: Any) -> tuple[float, float, float, float] | None:
     values: list[tuple[float, float]] = []
+
     def walk(node: Any) -> None:
-        if isinstance(node, list) and len(node) >= 2 and all(isinstance(v, (int, float)) for v in node[:2]):
+        if (
+            isinstance(node, list)
+            and len(node) >= 2
+            and all(isinstance(v, (int, float)) for v in node[:2])
+        ):
             values.append((float(node[0]), float(node[1])))
         elif isinstance(node, list):
             for child in node:
                 walk(child)
+
     if isinstance(geometry, dict):
         walk(geometry.get("coordinates"))
     if not values:
