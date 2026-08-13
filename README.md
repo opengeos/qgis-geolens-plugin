@@ -1,6 +1,6 @@
 # GeoLens for QGIS
 
-A QGIS 3.28+/4.x plugin for browsing and using datasets from a self-hosted GeoLens server. It brings the GeoLens catalog workflow from [GeoLibre](https://github.com/opengeos/GeoLibre) into QGIS and follows the structure of [opengeos/qgis-plugin-template](https://github.com/opengeos/qgis-plugin-template).
+A QGIS plugin for browsing and using datasets from a self-hosted GeoLens server. It brings the [GeoLens](https://github.com/geolens-io/geolens) catalog workflow from [GeoLibre](https://github.com/opengeos/GeoLibre) into QGIS.
 
 This is a community project and is not affiliated with, or endorsed by, any GeoLens vendor.
 
@@ -40,6 +40,8 @@ python install.py --plugin-dir /path/to/profile/python/plugins
 3. Search and select a dataset.
 4. Choose **Add tiles** for scalable viewing, or **Add features** for attributes and editing.
 5. For an editable feature layer, commit QGIS edits, select that layer, and click **Sync selected GeoLens layer edits**.
+
+![](https://github.com/user-attachments/assets/3842764d-6e33-4b2b-8cb5-d56d7db2bfca)
 
 GeoLens writes are per-feature and are not transactional. The plugin reports partial failures and requires confirmation before deleting server features. API keys are stored only in the local QGIS profile settings and are never written to project layer properties.
 
