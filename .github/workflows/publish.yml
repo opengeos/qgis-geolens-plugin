@@ -18,8 +18,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
-      QGIS_PLUGIN_REPO_USERNAME: ${{ secrets.QGIS_PLUGIN_REPO_USERNAME }}
-      QGIS_PLUGIN_REPO_PASSWORD: ${{ secrets.QGIS_PLUGIN_REPO_PASSWORD }}
+      # Only a boolean reaches job scope; the secrets themselves stay on the
+      # upload step so the packaging code cannot read them.
+      HAS_QGIS_CREDENTIALS: ${{ secrets.QGIS_PLUGIN_REPO_USERNAME != '' && secrets.QGIS_PLUGIN_REPO_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -38,5 +39,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "$TAG" dist/geolens_qgis.zip --clobber
       - name: Upload to QGIS Plugins
-        if: env.QGIS_PLUGIN_REPO_USERNAME != '' && env.QGIS_PLUGIN_REPO_PASSWORD != ''
+        if: env.HAS_QGIS_CREDENTIALS == 'true'
+        env:
+          QGIS_PLUGIN_REPO_USERNAME: ${{ secrets.QGIS_PLUGIN_REPO_USERNAME }}
+          QGIS_PLUGIN_REPO_PASSWORD: ${{ secrets.QGIS_PLUGIN_REPO_PASSWORD }}
         run: python scripts/upload_to_qgis_plugin_repo.py dist/geolens_qgis.zip

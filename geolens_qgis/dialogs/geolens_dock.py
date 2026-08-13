@@ -347,7 +347,11 @@ class GeoLensDock(QDockWidget):
             baseline = {}
             unidentified = 0
             for feature in collection["features"]:
-                props = feature.setdefault("properties", {})
+                # GeoJSON permits "properties": null, which setdefault keeps.
+                props = feature.get("properties")
+                if not isinstance(props, dict):
+                    props = {}
+                    feature["properties"] = props
                 gid = feature.get("id", props.get("gid"))
                 if isinstance(gid, int) and not isinstance(gid, bool):
                     props["_geolens_gid"] = gid
@@ -479,14 +483,25 @@ class GeoLensDock(QDockWidget):
             except GeoLensError as error:
                 errors.append(str(error))
         created = []
+        unaddressable = 0
         for fid, feature in creates:
             try:
                 gid = self.client.create_feature(dataset_id, feature)
-                if gid is not None:
-                    baseline[gid] = feature
-                    created.append((fid, gid))
             except GeoLensError as error:
                 errors.append(str(error))
+                continue
+            if gid is None:
+                # The feature exists on the server but cannot be addressed, so
+                # a second sync would create it again. The baseline is dropped
+                # below and the layer has to be reloaded first.
+                unaddressable += 1
+                errors.append(
+                    "A feature was created, but GeoLens returned no integer ID "
+                    "for it. Reload the layer before synchronizing again."
+                )
+                continue
+            baseline[gid] = feature
+            created.append((fid, gid))
         # One edit session for every new ID: each commit rewrites the layer file.
         gid_index = layer.fields().indexOf("_geolens_gid")
         if created and gid_index >= 0:
@@ -494,9 +509,11 @@ class GeoLensDock(QDockWidget):
             for fid, gid in created:
                 layer.changeAttributeValue(fid, gid_index, gid)
             if not layer.commitChanges():
+                unaddressable += len(created)
                 errors.append(
                     f"{len(created)} feature(s) were created, but their server "
-                    "IDs could not be stored locally"
+                    "IDs could not be stored locally. Reload the layer before "
+                    "synchronizing again."
                 )
         for gid in deletes:
             try:
@@ -504,6 +521,10 @@ class GeoLensDock(QDockWidget):
                 baseline.pop(gid, None)
             except GeoLensError as error:
                 errors.append(str(error))
+        if unaddressable:
+            # Features live on the server that this layer cannot match again.
+            self.baselines.pop(layer.id(), None)
+            self._update_actions()
         if errors:
             self._message(
                 f"Synchronized {total - len(errors)}/{total}; {len(errors)} failed. {errors[0]}",
