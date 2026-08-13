@@ -44,10 +44,7 @@ from ..client import Dataset, GeoLensClient, GeoLensError
 ROLE_DATASET = Qt.ItemDataRole.UserRole
 # QgsJsonExporter writes six decimal places by default (RFC 7946).
 EXPORT_PRECISION = 6
-SAMPLE_SERVERS = (
-    ("GeoLibre datasets", "https://datasets.geolibre.app"),
-    ("GeoLens demo", "https://demo.getgeolens.com"),
-)
+SAMPLE_SERVERS = (("GeoLibre datasets", "https://datasets.geolibre.app"),)
 
 
 class GeoLensDock(QDockWidget):

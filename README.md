@@ -1,6 +1,8 @@
 # GeoLens for QGIS
 
-A QGIS 3.28+/4.x plugin for browsing and using datasets from a self-hosted [GeoLens](https://getgeolens.com) server. It brings the GeoLens catalog workflow from [GeoLibre](https://github.com/opengeos/GeoLibre) into QGIS and follows the structure of [opengeos/qgis-plugin-template](https://github.com/opengeos/qgis-plugin-template).
+A QGIS 3.28+/4.x plugin for browsing and using datasets from a self-hosted GeoLens server. It brings the GeoLens catalog workflow from [GeoLibre](https://github.com/opengeos/GeoLibre) into QGIS and follows the structure of [opengeos/qgis-plugin-template](https://github.com/opengeos/qgis-plugin-template).
+
+This is a community project and is not affiliated with, or endorsed by, any GeoLens vendor.
 
 ## Features
 
@@ -11,7 +13,7 @@ A QGIS 3.28+/4.x plugin for browsing and using datasets from a self-hosted [GeoL
 - Load vector datasets through OGC API Features, optionally clipped to the current map extent.
 - Open a dataset's GeoLens metadata page.
 - Edit loaded feature layers in QGIS and synchronize creates, updates, and deletes back to GeoLens when the server permits editing.
-- Use the public GeoLibre datasets and GeoLens demo servers from the built-in server picker.
+- Use the public GeoLibre datasets server from the built-in server picker.
 
 ## Install for development
 
